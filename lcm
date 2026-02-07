@@ -2,6 +2,7 @@
 
 # llama-cpp-manager (lcm)
 # A repeatable, idempotent, user-local manager for llama.cpp
+# Author: Rui Lima (ruilima.ai)
 # License: MIT
 
 set -euo pipefail

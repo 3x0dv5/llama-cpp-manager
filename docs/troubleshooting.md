@@ -1,5 +1,7 @@
 # Troubleshooting
 
+**Author:** Rui Lima (ruilima.ai)
+
 This document provides solutions for common issues encountered when using `llama-cpp-manager` (lcm).
 
 ## 1. Permission Denied (sudo)

@@ -3,6 +3,7 @@
 ## llama-cpp-manager
 
 **Repository:** `llama-cpp-manager`
+**Author:** Rui Lima (ruilima.ai)
 **License:** MIT
 **Primary Platforms:** Linux (Ubuntu), MacOS
 **Primary Target:** Automated installation, update, and build management for `llama.cpp`

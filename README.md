@@ -101,4 +101,4 @@ You can override default paths using environment variables:
 
 ## License
 
-MIT
+MIT - Rui Lima (ruilima.ai)

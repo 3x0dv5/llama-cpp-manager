@@ -1,5 +1,6 @@
 # Feature Specification: Run Optimization
 
+**Author:** Rui Lima (ruilima.ai)
 **Feature:** `--optimize` flag for `run` command
 **Target Version:** v1.1
 **Parent Spec:** `docs/system-spec.md`

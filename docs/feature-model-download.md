@@ -1,5 +1,6 @@
 # Feature Specification: Model Auto-Download
 
+**Author:** Rui Lima (ruilima.ai)
 **Feature:** Optional model download from URLs
 **Target Version:** v1.2
 **Parent Spec:** `docs/system-spec.md`

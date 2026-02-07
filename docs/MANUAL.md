@@ -1,0 +1,233 @@
+# Llama-CPP-Manager: The Definitive Guide
+
+A repeatable, idempotent, user-local manager for the upstream `llama.cpp` project.
+Author: Rui Lima (ruilima.ai)
+
+---
+
+## Table of Contents
+
+1. [**Introduction**](#introduction)
+2. [**Chapter 1: Getting Started**](#chapter-1-getting-started)
+    *   [Installation](#installation)
+    *   [System Requirements](#system-requirements)
+3. [**Chapter 2: Core Operations**](#chapter-2-core-operations)
+    *   [Automated Setup](#automated-setup)
+    *   [Manual Build Control](#manual-build-control)
+    *   [Cleaning and Resetting](#cleaning-and-resetting)
+4. [**Chapter 3: Advanced Building**](#chapter-3-advanced-building)
+    *   [Containerized Builds](#containerized-builds)
+    *   [Compiler Management](#compiler-selection)
+    *   [Hardware Acceleration](#hardware-acceleration)
+5. [**Chapter 4: Model Management**](#chapter-4-model-management)
+    *   [Hugging Face Integration](#hugging-face-integration)
+    *   [Auto-Download & Caching](#auto-download-and-caching)
+6. [**Chapter 5: Runtime & Optimization**](#chapter-5-runtime-and-optimization)
+    *   [The Optimization Engine](#optimization-engine)
+    *   [CLI vs Server Mode](#cli-vs-server-mode)
+    *   [Configuration Files](#configuration-files)
+7. [**Chapter 6: System Diagnosis**](#chapter-6-system-diagnosis)
+    *   [The Status Command](#the-status-command)
+    *   [Remediation Logic](#remediation-logic)
+8. [**Appendix A: Technical Hurdles & Resolutions**](#appendix-a-technical-hurdles-and-resolutions)
+9. [**Index**](#index)
+
+---
+
+## Introduction
+
+`llama-cpp-manager` (lcm) is designed to solve the "it works on my machine" problem for the `llama.cpp` ecosystem. It provides a stable, repeatable, and user-local environment for building and running large language models without cluttering system-wide directories or requiring constant manual intervention.
+
+The philosophy of the project is built on three pillars:
+1.  **Idempotency:** Re-running any command converges to a stable state.
+2.  **User-Locality:** Artifacts live in `~/.local`, avoiding `sudo` where possible.
+3.  **Stability:** Automatic detection and workarounds for system-level library conflicts.
+
+---
+
+## Chapter 1: Getting Started
+
+### Installation
+
+To install `lcm`, simply download the script and grant it execution permissions:
+
+```bash
+chmod +x lcm
+```
+
+### System Requirements
+
+*   **Linux:** Ubuntu 22.04+ (Primary), Debian-based.
+*   **MacOS:** Ventura 13.0+ (Universal).
+*   **Dependencies:** `git`, `cmake`, `build-essential`, `python3`, `curl`, `git-lfs`.
+
+---
+
+## Chapter 2: Core Operations
+
+### Automated Setup
+
+The most common way to start is the full installation command:
+
+```bash
+./lcm --install-llama-cpp
+```
+This single command handles dependency verification, repository cloning, hardware detection, and compilation.
+
+### Manual Build Control
+
+If the source is already present, you can trigger a build without updating the repository:
+
+```bash
+./lcm --build
+```
+
+For a CPU-only build (ignoring detected GPUs):
+```bash
+./lcm --build --cpu
+```
+
+### Cleaning and Resetting
+
+If a build becomes corrupted or you wish to start over:
+```bash
+./lcm --clean
+```
+
+---
+
+## Chapter 3: Advanced Building
+
+### Containerized Builds
+
+When the host system libraries (like `glibc` or `gcc`) are incompatible with the CUDA Toolkit, `lcm` provides a stable containerized build path using Docker or Podman.
+
+```bash
+./lcm --build --container
+```
+This uses an Ubuntu 22.04 base image with CUDA 12, ensuring a consistent build environment regardless of your host OS version.
+
+### Compiler Selection
+
+`lcm` intelligently detects compiler incompatibilities. For instance, if your system defaults to GCC 15 but you are building for CUDA (which supports max GCC 14), `lcm` will automatically look for and use `gcc-14`.
+
+Manual overrides are supported via environment variables:
+```bash
+LCM_CC=gcc-12 LCM_CXX=g++-12 ./lcm --build
+```
+
+---
+
+## Chapter 4: Model Management
+
+### Hugging Face Integration
+
+`lcm` supports standard `llama-cpp` `-hf` identifiers. This allows you to reference models by their repository and filename directly.
+
+```bash
+./lcm --run --model -hf unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M
+```
+
+### Auto-Download and Caching
+
+If you specify a `--download-dir`, `lcm` will manage the full lifecycle of the model repository:
+
+```bash
+./lcm --run --model -hf user/repo:file --download-dir ./models
+```
+*   **Structured Storage:** Models are saved in `download-dir/user/repo/`.
+*   **Resume Support:** If the directory exists, `lcm` performs a `git pull` with progress reporting.
+*   **LFS Support:** Weight files are correctly handled via Git LFS.
+
+---
+
+## Chapter 5: Runtime and Optimization
+
+### Optimization Engine
+
+The `--optimize` flag analyzes your hardware (Physical Cores, RAM, VRAM) and your specific model file to suggest the fastest parameters.
+
+```bash
+./lcm --run --model path/to/model.gguf --optimize config.json
+```
+
+It generates a structured report:
+*   **Threads:** Optimized for physical cores.
+*   **GPU Offload:** Calculated based on model size vs. available VRAM.
+*   **Batch Size:** Adjusted for the detected backend (CPU vs. GPU).
+
+### CLI vs Server Mode
+
+Switch between interactive chat and a persistent API server:
+
+```bash
+# Chat mode
+./lcm --run --model model.gguf --mode cli
+
+# API Server
+./lcm --run --model model.gguf --mode server
+```
+
+### Configuration Files
+
+Once optimized, you can load your settings from a JSON file:
+```bash
+./lcm --run --model model.gguf --config config.json
+```
+
+---
+
+## Chapter 6: System Diagnosis
+
+### The Status Command
+
+The most powerful tool for troubleshooting is the status check:
+
+```bash
+./lcm --status
+```
+
+It provides a multi-section audit:
+1.  **Dependencies:** Version checks for Git, CMake, Python, etc.
+2.  **glibc Compatibility:** Detects host-system library versions.
+3.  **Container Readiness:** Verifies Docker/Podman functionality.
+4.  **Hardware Acceleration:** Audits GPU, CUDA Toolkit, and GCC versions.
+
+---
+
+## Appendix A: Technical Hurdles and Resolutions
+
+During the development of `lcm`, several significant technical challenges were overcome:
+
+### 1. The GCC 15 / CUDA 12 Conflict
+**Issue:** Modern distributions (like Ubuntu 25.10) default to GCC 15, which `nvcc` (CUDA compiler) rejects.
+**Resolution:** `lcm` implements a heuristic search for compatible GCC versions (11-14). It explicitly sets `CMAKE_CUDA_HOST_COMPILER` to bypass the system default.
+
+### 2. glibc 2.41+ Math Header Conflicts
+**Issue:** `glibc` 2.41 introduced `sinpi`/`cospi` declarations that conflict with CUDA's internal headers, causing build failures even with compatible GCC.
+**Resolution:** `lcm` detects `glibc` versions >= 2.41. It forces a CPU-only build on the host to maintain stability and directs users to the `--container` path for GPU acceleration.
+
+### 3. Bash Stdout Pollution
+**Issue:** Using `$(detect_backend_flags)` captured log messages (timestamps) into the variable, breaking the `cmake` command.
+**Resolution:** All `log()` and `error()` functions were redirected to `stderr` (`>&2`). This keeps `stdout` clean for programmatic data (like JSON or flags) while still showing logs to the user.
+
+### 4. Git LFS Silent Downloads
+**Issue:** `git clone` appeared stuck because Git LFS downloads large weights without showing progress in non-interactive shells.
+**Resolution:** Explicitly exporting `GIT_LFS_PROGRESS=1` and using `--progress` flags for all Git operations.
+
+---
+
+## Index
+
+*   **Build**, [Manual Control](#manual-build-control)
+*   **ccache**, [Performance](#chapter-1-getting-started)
+*   **Container**, [Building](#containerized-builds)
+*   **CUDA**, [Acceleration](#hardware-acceleration)
+*   **glibc**, [Incompatibility](#appendix-a-technical-hurdles-and-resolutions)
+*   **Hugging Face**, [Models](#hugging-face-integration)
+*   **Idempotency**, [Introduction](#introduction)
+*   **LCM_CC**, [Compiler Override](#compiler-selection)
+*   **LFS**, [Downloads](#appendix-a-technical-hurdles-and-resolutions)
+*   **Optimization**, [Parameters](#optimization-engine)
+*   **Server**, [API Mode](#cli-vs-server-mode)
+*   **Status**, [Diagnosis](#the-status-command)
