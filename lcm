@@ -1,0 +1,1204 @@
+#!/usr/bin/env bash
+
+# llama-cpp-manager (lcm)
+# A repeatable, idempotent, user-local manager for llama.cpp
+# License: MIT
+
+set -euo pipefail
+
+# Ensure Git LFS progress is shown globally
+export GIT_LFS_PROGRESS=1
+
+# --- Configuration & Defaults ---
+
+LCM_LLAMA_DIR="${LCM_LLAMA_DIR:-$HOME/.local/src/llama.cpp}"
+LCM_BUILD_DIR="${LCM_BUILD_DIR:-$LCM_LLAMA_DIR/build}"
+LCM_BIN_DIR="${LCM_BIN_DIR:-$HOME/.local/bin}"
+LCM_REPO_URL="${LCM_REPO_URL:-https://github.com/ggerganov/llama.cpp.git}"
+
+export LCM_BIN_DIR LCM_BUILD_DIR
+
+# Determine number of parallel jobs
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    LCM_JOBS="${LCM_JOBS:-$(nproc)}"
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    LCM_JOBS="${LCM_JOBS:-$(sysctl -n hw.ncpu)}"
+else
+    LCM_JOBS="${LCM_JOBS:-1}"
+fi
+
+# --- Helper Functions ---
+
+log() {
+    echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*" >&2
+}
+
+error() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: lcm [COMMAND] [ARGUMENTS]
+
+Commands:
+  --install-llama-cpp    Install dependencies, clone repo, and build
+  --update-llama-cpp     Update repo and rebuild
+  --build                Build llama.cpp without updating source
+  --run                  Run a minimal inference sanity check
+  --status               Check system readiness and show missing steps
+  --clean                Remove build artifacts
+  --clone                Clone llama.cpp source repository
+  --help                 Display this help message
+
+Arguments:
+  --container            (Optional) Run build/install inside a stable Docker container
+  --cpu                  (Optional) Force a CPU-only build, disabling GPU detection
+
+Arguments for --run:
+  --model <path|url>     Path to .gguf model, HTTP(S) URL, or Hugging Face ID (required)
+  --prompt <text>        Prompt text (optional)
+  --optimize [file]      Output optimal parameters (optionally to a JSON file)
+  --config <file>        Load parameters from a JSON configuration file
+  --mode <cli|server>    Execution mode: cli (default) or server
+  --download-dir <path>  Enable auto-download and set target directory
+
+Environment Variables:
+  LCM_LLAMA_DIR    Source checkout directory (default: $HOME/.local/src/llama.cpp)
+  LCM_BIN_DIR      Binary symlink directory (default: $HOME/.local/bin)
+  LCM_REPO_URL     llama.cpp GitHub URL
+  LCM_JOBS         Number of parallel build jobs (default: auto)
+  LCM_FORCE_CPU    Set to 1 to disable GPU acceleration (default: 0)
+  LCM_CC           Override C compiler (e.g., gcc-14)
+  LCM_CXX          Override C++ compiler (e.g., g++-14)
+
+Examples:
+  # Install and build everything
+  ./lcm --install-llama-cpp
+
+  # Optimize parameters for a local model
+  ./lcm --run --model ~/models/llama-3-8b.gguf --optimize
+
+  # Download and run a Hugging Face model (standard llama-cpp syntax)
+  ./lcm --run --model -hf unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M --download-dir /media/u/Models/lcm_models/
+
+  # Force CPU build even if GPU is detected
+  LCM_FORCE_CPU=1 ./lcm --build
+EOF
+}
+
+check_dependencies() {
+    log "Checking dependencies..."
+    local deps=()
+    local missing=()
+
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        deps=(git git-lfs cmake build-essential pkg-config python3 libopenblas-dev curl)
+        for dep in "${deps[@]}"; do
+            if ! dpkg -s "$dep" >/dev/null 2>&1 && ! which "$dep" >/dev/null 2>&1; then
+                missing+=("$dep")
+            fi
+        done
+
+        if [ ${#missing[@]} -gt 0 ]; then
+            log "Missing dependencies: ${missing[*]}"
+            log "Attempting to install via apt (sudo required)..."
+            sudo apt update && sudo apt install -y "${missing[@]}"
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        deps=(git cmake python3 pkg-config curl)
+        for dep in "${deps[@]}"; do
+            if ! which "$dep" >/dev/null 2>&1; then
+                missing+=("$dep")
+            fi
+        done
+
+        if [ ${#missing[@]} -gt 0 ]; then
+            log "Missing dependencies: ${missing[*]}"
+            if ! which brew >/dev/null 2>&1; then
+                error "Homebrew not found. Please install Homebrew or manually install: ${missing[*]}"
+            fi
+            log "Attempting to install via brew..."
+            brew install "${missing[@]}"
+        fi
+    else
+        error "Unsupported OS: $OSTYPE"
+    fi
+}
+
+clone_repo() {
+    if [ -d "$LCM_LLAMA_DIR/.git" ]; then
+        log "Repository already exists at $LCM_LLAMA_DIR"
+    elif [ -d "$LCM_LLAMA_DIR" ] && [ "$(ls -A "$LCM_LLAMA_DIR")" ]; then
+        error "Directory $LCM_LLAMA_DIR exists and is not empty, but is not a git repository. Please remove it or choose a different LCM_LLAMA_DIR."
+    else
+        log "Cloning llama.cpp to $LCM_LLAMA_DIR..."
+        mkdir -p "$(dirname "$LCM_LLAMA_DIR")"
+        git clone "$LCM_REPO_URL" "$LCM_LLAMA_DIR"
+    fi
+}
+
+update_repo() {
+    log "Updating repository at $LCM_LLAMA_DIR..."
+    if [ ! -d "$LCM_LLAMA_DIR/.git" ]; then
+        error "No git repository found at $LCM_LLAMA_DIR. Run --install-llama-cpp first."
+    fi
+    cd "$LCM_LLAMA_DIR"
+    git fetch --all
+    git pull origin "$(git rev-parse --abbrev-ref HEAD)"
+}
+
+detect_backend_flags() {
+    local flags=("-DCMAKE_BUILD_TYPE=Release" "-DLLAMA_BUILD_TESTS=OFF" "-DLLAMA_BUILD_EXAMPLES=ON")
+
+    # Use ccache if available
+    if which ccache >/dev/null 2>&1; then
+        log "ccache detected. Enabling for faster builds."
+        flags+=("-DCMAKE_C_COMPILER_LAUNCHER=ccache" "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache")
+    fi
+
+    if [[ "${LCM_FORCE_CPU:-0}" == "1" ]]; then
+        log "LCM_FORCE_CPU=1 detected. Forcing CPU-only build."
+        echo "${flags[@]}"
+        return
+    fi
+
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if which nvcc >/dev/null 2>&1; then
+            log "NVIDIA CUDA detected (nvcc found). Enabling CUDA backend."
+            flags+=("-DGGML_CUDA=ON")
+
+            # Check for glibc compatibility (2.41+ has conflicts with CUDA cospi/sinpi)
+            local glibc_ver
+            glibc_ver=$(ldd --version | head -n1 | grep -oE '[0-9]+\.[0-9]+' | tail -n1)
+            if [[ $(echo -e "$glibc_ver\n2.41" | sort -V | head -n1) == "2.41" ]]; then
+                log "WARNING: glibc $glibc_ver detected. Incompatible with CUDA 12 (sinpi/cospi conflict)."
+                log "Forcing CPU-only build. Use --container to build with GPU support."
+                # Don't enable CUDA
+                return 
+            else
+                flags+=("-DGGML_CUDA=ON")
+            fi
+
+            # Check for GCC compatibility with CUDA
+            # Allow manual override via LCM_CC / LCM_CXX
+            if [ -n "${LCM_CC:-}" ] && [ -n "${LCM_CXX:-}" ]; then
+                log "Using user-specified compiler: $LCM_CC / $LCM_CXX"
+                flags+=("-DCMAKE_C_COMPILER=$LCM_CC" "-DCMAKE_CXX_COMPILER=$LCM_CXX" "-DCMAKE_CUDA_HOST_COMPILER=$LCM_CC")
+            else
+                local gcc_ver
+                if command -v gcc >/dev/null 2>&1; then
+                    gcc_ver=$(gcc -dumpversion | cut -d. -f1)
+                    # Assuming CUDA 12.x supports up to GCC 13/14. GCC 15+ is definitely risky.
+                    if [ "$gcc_ver" -ge 15 ]; then
+                        log "WARNING: Default GCC version $gcc_ver might be too new for CUDA."
+                        log "Attempting to find a compatible GCC version (<=14)..."
+                        
+                        # Try finding gcc-14, gcc-13, gcc-12
+                        local compat_cc=""
+                        local compat_cxx=""
+                        for ver in 14 13 12 11; do
+                            if command -v "gcc-$ver" >/dev/null 2>&1 && command -v "g++-$ver" >/dev/null 2>&1; then
+                                compat_cc="gcc-$ver"
+                                compat_cxx="g++-$ver"
+                                log "Found compatible compiler: $compat_cc / $compat_cxx"
+                                break
+                            fi
+                        done
+
+                        if [ -n "$compat_cc" ]; then
+                            flags+=("-DCMAKE_C_COMPILER=$compat_cc" "-DCMAKE_CXX_COMPILER=$compat_cxx" "-DCMAKE_CUDA_HOST_COMPILER=$compat_cc")
+                        else
+                            log "WARNING: No compatible GCC version found. Attempting to bypass version check with '-allow-unsupported-compiler'."
+                            flags+=("-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler")
+                        fi
+                    fi
+                fi
+            fi
+
+        else
+            log "No GPU acceleration detected. Using CPU (OpenBLAS if available)."
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        log "MacOS detected. Enabling Metal backend."
+        flags+=("-DGGML_METAL=ON")
+    fi
+
+    echo "${flags[@]}"
+}
+
+build_llama_cpp() {
+    log "Starting build in $LCM_BUILD_DIR..."
+    mkdir -p "$LCM_BUILD_DIR"
+    cd "$LCM_BUILD_DIR"
+
+    local cmake_flags
+    cmake_flags=$(detect_backend_flags)
+
+    log "Configuring with: cmake .. $cmake_flags"
+    cmake .. $cmake_flags
+
+    log "Building with $LCM_JOBS jobs..."
+    cmake --build . -j "$LCM_JOBS"
+}
+
+install_binaries() {
+    log "Installing binary symlinks to $LCM_BIN_DIR..."
+    mkdir -p "$LCM_BIN_DIR"
+
+    local binaries=(llama-cli llama-server llama-quantize llama-bench llama-perplexity)
+    for bin in "${binaries[@]}"; do
+        local source_bin="$LCM_BUILD_DIR/bin/$bin"
+        if [ ! -f "$source_bin" ]; then
+            # Older versions or different build structures might put them directly in build dir
+            if [ -f "$LCM_BUILD_DIR/$bin" ]; then
+                source_bin="$LCM_BUILD_DIR/$bin"
+            else
+                log "Warning: Binary $bin not found in build directory. Skipping."
+                continue
+            fi
+        fi
+
+        ln -sf "$source_bin" "$LCM_BIN_DIR/$bin"
+        log "Symlinked $bin -> $source_bin"
+    done
+
+    if [[ ":$PATH:" != *":$LCM_BIN_DIR:"* ]]; then
+        log "Reminder: $LCM_BIN_DIR is not in your PATH. Add it with: export PATH="\$PATH:$LCM_BIN_DIR""
+    fi
+}
+
+find_cached_model_file() {
+    local repo="$1"
+    local file="$2"
+    local hf_cache="$HOME/.cache/huggingface/hub"
+    local llama_cache="$HOME/.cache/llama.cpp"
+    
+    # 1. Check llama.cpp native cache (flattened names: repo_user_model_name_filename.gguf)
+    if [ -d "$llama_cache" ]; then
+        local flat_repo="${repo//\//_}"
+        local match
+        # Search for repo name and file part in the filename using find for robustness
+        match=$(find "$llama_cache" -maxdepth 1 -name "*${flat_repo}*${file}*.gguf" -print -quit)
+        if [ -n "$match" ] && [ -f "$match" ]; then
+            echo "$match"
+            return 0
+        fi
+    fi
+
+    # 2. Check standard Hugging Face hub cache (snapshots structure)
+    local repo_folder="models--${repo/\//--}"
+    if [ -d "$hf_cache/$repo_folder/snapshots" ]; then
+        local search_file="$file"
+        [[ "$search_file" != *.gguf ]] && search_file="${search_file}.gguf"
+        local latest_snap
+        latest_snap=$(ls -t "$hf_cache/$repo_folder/snapshots" 2>/dev/null | head -n1)
+        if [ -n "$latest_snap" ] && [ -f "$hf_cache/$repo_folder/snapshots/$latest_snap/$search_file" ]; then
+            echo "$hf_cache/$repo_folder/snapshots/$latest_snap/$search_file"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+get_binary_type() {
+
+    local bin="$LCM_BIN_DIR/llama-cli"
+
+    if [ ! -x "$bin" ]; then
+
+        echo "unknown"
+
+        return
+
+    fi
+
+
+
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+
+        if ldd "$bin" 2>/dev/null | grep -qi "cuda"; then
+
+            echo "CUDA"
+
+        else
+
+            echo "CPU"
+
+        fi
+
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+
+        # On macOS, check for Metal linking
+
+        if otool -L "$bin" 2>/dev/null | grep -qi "Metal"; then
+
+            echo "Metal"
+
+        else
+
+            echo "CPU"
+
+        fi
+
+    else
+
+        echo "CPU"
+
+    fi
+
+}
+
+
+run_optimization() {
+    local model="$1"
+    local output_file="${2:-}"
+    
+    if [[ "$model" == "-hf "* ]]; then
+        local hf_id="${model#-hf }"
+        local repo="${hf_id%:*}"
+        local file="${hf_id#*:}"
+        
+        # Try to find it in known cache locations
+        local cached_path
+        if cached_path=$(find_cached_model_file "$repo" "$file"); then
+            log "Found model in cache: $cached_path"
+            model="$cached_path"
+        else
+            error "Optimization requires analyzing the model file size. The model is not in the cache. Please provide --download-dir to download it to a specific location first."
+        fi
+    fi
+
+    # --- Binary Backend Detection ---
+    local binary_type
+    binary_type=$(get_binary_type)
+
+    # --- Hardware Detection (Bash Side) ---
+    local cpu_phys
+    local cpu_log
+    local ram_mb
+    local gpu_type="CPU"
+    local gpu_vram_mb=0
+    local model_size_mb
+
+    # CPU & RAM
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # Try to get physical cores, fallback to nproc/2 if lscpu fails
+        if command -v lscpu >/dev/null; then
+            cpu_phys=$(lscpu -p | grep -v '#' | sort -u -t, -k 2,2 | wc -l)
+        else
+            cpu_phys=$(($(nproc) / 2))
+        fi
+        cpu_log=$(nproc)
+        ram_mb=$(free -m | awk '/^Mem:/{print $2}')
+        
+        # GPU (NVIDIA)
+        if command -v nvidia-smi >/dev/null; then
+            gpu_type="CUDA"
+            # Get total VRAM of device 0 (in MB)
+            gpu_vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n1)
+        fi
+
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        cpu_phys=$(sysctl -n hw.physicalcpu)
+        cpu_log=$(sysctl -n hw.logicalcpu)
+        # memsize is in bytes
+        ram_mb=$(($(sysctl -n hw.memsize) / 1024 / 1024))
+        
+        # GPU (Metal - Apple Silicon)
+        if [[ "$(uname -m)" == "arm64" ]]; then
+            gpu_type="Metal"
+            # Unified memory: VRAM is effectively RAM (minus system reserve)
+            gpu_vram_mb=$ram_mb
+        fi
+    fi
+
+    # Model Size
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        model_size_mb=$(($(stat -f %z "$model") / 1024 / 1024))
+    else
+        model_size_mb=$(($(stat -c %s "$model") / 1024 / 1024))
+    fi
+
+    # --- Optimization Logic (Python Side) ---
+    export CPU_PHYS="$cpu_phys"
+    export CPU_LOG="$cpu_log"
+    export RAM_MB="$ram_mb"
+    export GPU_TYPE="$gpu_type"
+    export GPU_VRAM_MB="$gpu_vram_mb"
+    export MODEL_PATH="$model"
+    export MODEL_SIZE_MB="$model_size_mb"
+    export BINARY_TYPE="$binary_type"
+    export OUTPUT_FILE="$output_file"
+
+    python3 -c '
+import os
+import json
+import math
+
+def get_env_int(key, default=0):
+    try:
+        return int(os.environ.get(key, default))
+    except:
+        return default
+
+cpu_phys = get_env_int("CPU_PHYS", 1)
+cpu_log = get_env_int("CPU_LOG", 1)
+ram_mb = get_env_int("RAM_MB", 1024)
+hw_gpu_type = os.environ.get("GPU_TYPE", "CPU")
+gpu_vram_mb = get_env_int("GPU_VRAM_MB", 0)
+model_path = os.environ.get("MODEL_PATH", "")
+model_size_mb = get_env_int("MODEL_SIZE_MB", 0)
+binary_type = os.environ.get("BINARY_TYPE", "unknown")
+output_file = os.environ.get("OUTPUT_FILE", "")
+
+rationale = []
+params = {}
+
+# 1. Threads
+# Use physical cores - 1 (leave one for system), min 1.
+threads = max(1, cpu_phys - 1)
+params["--threads"] = threads
+rationale.append(f"Threads: {threads} (Physical cores {cpu_phys} - 1 reserved)")
+
+# 2. GPU Layers & Offload
+n_gpu_layers = 0
+# Effective backend is the intersection of hardware and software support
+effective_gpu = "CPU"
+if hw_gpu_type == binary_type and hw_gpu_type in ["CUDA", "Metal"]:
+    effective_gpu = hw_gpu_type
+elif hw_gpu_type in ["CUDA", "Metal"] and binary_type == "CPU":
+    rationale.append(f"GPU Support: Hardware has {hw_gpu_type}, but llama-cli was compiled for CPU only. Forcing CPU mode.")
+elif binary_type == "unknown":
+    rationale.append("GPU Support: Binary state unknown. Defaulting to CPU-safe parameters.")
+
+if effective_gpu in ["CUDA", "Metal"]:
+    # Estimate overhead (1.2x safety factor for context + kv cache)
+    required_vram = model_size_mb * 1.2
+    
+    if gpu_vram_mb >= required_vram:
+        n_gpu_layers = 999  # Offload all
+        rationale.append(f"GPU Offload: Full (Model {model_size_mb}MB fits in {gpu_vram_mb}MB VRAM)")
+    else:
+        # Partial offload logic: linear scaling
+        ratio = gpu_vram_mb / required_vram
+        est_layers = 35 
+        n_gpu_layers = int(est_layers * ratio)
+        rationale.append(f"GPU Offload: Partial ({n_gpu_layers} layers) - Model larger than VRAM")
+else:
+    rationale.append("GPU Offload: None (CPU only)")
+
+params["--n-gpu-layers"] = n_gpu_layers
+
+# 3. Context Window
+# Default safe value
+params["--ctx-size"] = 4096
+rationale.append("Context: 4096 (Safe default)")
+
+# 4. Batch Size
+if effective_gpu != "CPU" and n_gpu_layers > 0:
+    params["--batch-size"] = 512
+    rationale.append("Batch Size: 512 (GPU enabled)")
+else:
+    params["--batch-size"] = 256
+    rationale.append("Batch Size: 256 (CPU optimized)")
+
+# 5. Mlock
+# If RAM > Model * 1.5, lock it.
+if ram_mb > (model_size_mb * 1.5):
+    params["--mlock"] = True
+    rationale.append(f"Memory Lock: Enabled (Sys RAM {ram_mb}MB >> Model {model_size_mb}MB)")
+else:
+    params["--mlock"] = False
+    rationale.append("Memory Lock: Disabled (Insufficient RAM headroom)")
+
+output = {
+    "hardware": {
+        "cpu_cores_physical": cpu_phys,
+        "cpu_cores_logical": cpu_log,
+        "ram_total_mb": ram_mb,
+        "gpu_type": hw_gpu_type,
+        "gpu_vram_mb": gpu_vram_mb
+    },
+    "software": {
+        "binary_path": os.environ.get("LCM_BIN_DIR", "") + "/llama-cli",
+        "binary_type": binary_type
+    },
+    "model": {
+        "path": model_path,
+        "size_mb": model_size_mb
+    },
+    "recommended_params": params,
+    "rationale": rationale
+}
+
+json_str = json.dumps(output, indent=2)
+print(json_str)
+
+if output_file:
+    with open(output_file, "w") as f:
+        f.write(json_str)
+    print(f"\n[INFO] Configuration saved to {output_file}", file=os.sys.stderr)
+'
+}
+
+
+
+resolve_model_path() {
+    local input_path="$1"
+    local download_dir="$2"
+    
+    # Handle Hugging Face identifier (-hf repo:file)
+    if [[ "$input_path" == "-hf "* ]]; then
+        # If no download dir, we skip OUR download logic and let llama-cli handle it
+        if [ -z "$download_dir" ]; then
+            echo "$input_path"
+            return
+        fi
+        
+        local hf_id="${input_path#-hf }"
+        local repo="${hf_id%:*}"
+        local file="${hf_id#*:}"
+        
+        if [[ "$repo" == "$file" ]]; then
+            error "Invalid Hugging Face identifier: $hf_id (expected repo:file)"
+        fi
+
+        # Normalise download dir
+        local target_repo_dir="${download_dir%/}/$repo"
+        
+        if [ -d "$target_repo_dir/.git" ]; then
+            log "Hugging Face repository already exists at $target_repo_dir. Updating..."
+            GIT_LFS_PROGRESS=1 git -C "$target_repo_dir" pull --progress
+        else
+            log "Cloning Hugging Face repository $repo into $target_repo_dir..."
+            mkdir -p "$(dirname "$target_repo_dir")"
+            # We use git clone. Ensure git-lfs is installed for weights!
+            if ! GIT_LFS_PROGRESS=1 git clone --progress "https://huggingface.co/$repo" "$target_repo_dir"; then
+                error "Failed to clone repository from Hugging Face."
+            fi
+        fi
+
+        # Determine the file path inside the repo
+        local local_file_path="$target_repo_dir/$file"
+        if [ ! -f "$local_file_path" ] && [ -f "${local_file_path}.gguf" ]; then
+            local_file_path="${local_file_path}.gguf"
+        fi
+
+        if [ ! -f "$local_file_path" ]; then
+            error "Model file '$file' not found in cloned repository $repo."
+        fi
+
+        echo "$local_file_path"
+        return
+    fi
+
+    # Only attempt download if it is a URL AND download_dir is specified
+    if [[ "$input_path" == http://* ]] || [[ "$input_path" == https://* ]]; then
+        if [ -n "$download_dir" ]; then
+            local target_dir="${download_dir%/}"
+            if [ -n "$hf_repo" ]; then
+                target_dir="$target_dir/$hf_repo"
+            fi
+            mkdir -p "$target_dir"
+            
+            # Extract filename from URL
+            local filename
+            filename=$(basename "$input_path")
+            
+            # Determine local path
+            local local_path="$target_dir/$filename"
+            
+            if [ -f "$local_path" ]; then
+                log "Model found in cache: $local_path"
+            else
+                log "Downloading model from $input_path..."
+                # Added -f to fail on server errors (prevent saving HTML error pages)
+                if ! curl -f -L -o "$local_path" "$input_path"; then
+                    rm -f "$local_path" # Clean up partial download or error body
+                    error "Failed to download model from $input_path. Verify the repository and filename."
+                fi
+                log "Download complete: $local_path"
+            fi
+            
+            echo "$local_path"
+            return
+        fi
+    fi
+    
+    # Return as-is if not a URL or download_dir not provided
+    echo "$input_path"
+}
+
+run_sanity_check() {
+    local model=""
+    local prompt="Hello, how are you today?"
+    local optimize_mode=0
+    local optimize_file=""
+    local download_dir=""
+    local mode="cli"
+    local config_file=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --model)
+                if [[ "${2:-}" == "-hf" ]]; then
+                    model="-hf $3"
+                    shift 3
+                else
+                    model="$2"
+                    shift 2
+                fi
+                ;;
+            --prompt) prompt="$2"; shift 2 ;;
+            --optimize)
+                optimize_mode=1
+                # Check if next arg is a file (doesn't start with --)
+                if [[ -n "${2:-}" ]] && [[ ! "$2" == --* ]]; then
+                    optimize_file="$2"
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            --download-dir) download_dir="$2"; shift 2 ;;
+            --mode) mode="$2"; shift 2 ;;
+            --config) config_file="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$model" ]; then
+        error "--run requires --model <path|url>"
+    fi
+
+    # Resolve model path (handles download if URL and download_dir is set)
+    local resolved_model
+    resolved_model=$(resolve_model_path "$model" "$download_dir")
+
+    # If it is not a -hf identifier, it must be a real file
+    if [[ "$resolved_model" != "-hf "* ]] && [ ! -f "$resolved_model" ]; then
+        error "Model file not found: $resolved_model"
+    fi
+
+    if [ "$optimize_mode" -eq 1 ]; then
+        run_optimization "$resolved_model" "$optimize_file"
+        exit 0
+    fi
+
+    # Determine binary
+    local binary_name="llama-cli"
+    [[ "$mode" == "server" ]] && binary_name="llama-server"
+    
+    local binary_path="$LCM_BIN_DIR/$binary_name"
+    if [ ! -x "$binary_path" ]; then
+        error "$binary_name not found or not executable at $binary_path. Did you build it?"
+    fi
+
+    # Prepare execution arguments
+    local run_args=()
+    
+    if [[ "$resolved_model" == "-hf "* ]]; then
+        local hf_val="${resolved_model#-hf }"
+        run_args+=("-hf" "$hf_val")
+    else
+        run_args+=("-m" "$resolved_model")
+    fi
+
+    # Load from config if provided
+    if [ -n "$config_file" ]; then
+        if [ ! -f "$config_file" ]; then
+            error "Configuration file not found: $config_file"
+        fi
+        log "Loading configuration from $config_file..."
+        
+        # Use Python to parse the JSON and extract recommended_params
+        local json_params
+        json_params=$(python3 -c "
+import json
+import sys
+try:
+    with open('$config_file', 'r') as f:
+        data = json.load(f)
+        params = data.get('recommended_params', {})
+        for k, v in params.items():
+            if isinstance(v, bool):
+                if v: print(k)
+            else:
+                print(f'{k} {v}')
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+")
+        # Split by newline and add to args
+        log "Parameters from config:"
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            log "  $line"
+            read -r -a parts <<< "$line"
+            run_args+=("${parts[@]}")
+        done <<< "$json_params"
+    fi
+
+    # Add default prompt if in CLI mode and not provided in config
+    if [[ "$mode" == "cli" ]]; then
+        # Simple check if -p or --prompt is already in run_args
+        local has_prompt=0
+        for arg in "${run_args[@]}"; do
+            [[ "$arg" == "-p" || "$arg" == "--prompt" ]] && has_prompt=1
+        done
+        if [ "$has_prompt" -eq 0 ]; then
+            run_args+=("-p" "$prompt")
+        fi
+        
+        # Ensure we don't truncate unless specifically requested in config
+        local has_n=0
+        for arg in "${run_args[@]}"; do
+            [[ "$arg" == "-n" || "$arg" == "--n-predict" ]] && has_n=1
+        done
+        if [ "$has_n" -eq 0 ]; then
+            run_args+=("-n" "-1")
+        fi
+    fi
+
+    log "Full command: $binary_path ${run_args[*]}"
+    "$binary_path" "${run_args[@]}"
+}
+
+build_in_container() {
+    local runtime=""
+    if command -v docker >/dev/null 2>&1; then
+        runtime="docker"
+    elif command -v podman >/dev/null 2>&1; then
+        runtime="podman"
+    else
+        error "No container runtime (docker/podman) found. Cannot run containerized build."
+    fi
+
+    log "Detected container runtime: $runtime"
+
+    # Build the builder image
+    if [ ! -f "Dockerfile.lcm" ]; then
+        error "Dockerfile.lcm not found. Please ensure you are in the project root."
+    fi
+
+    log "Building container image 'lcm-builder'..."
+    if ! $runtime build -t lcm-builder -f Dockerfile.lcm .; then
+        error "Failed to build container image."
+    fi
+
+    # Determine GPU flags
+    local gpu_flags=""
+    if [[ "$runtime" == "docker" ]]; then
+        gpu_flags="--gpus all"
+    elif [[ "$runtime" == "podman" ]]; then
+        # Podman might need specific hooks or just work with --device nvidia.com/gpu=all
+        # For simplicity, we'll try the standard nvidia hook if available
+        gpu_flags="--device nvidia.com/gpu=all" 
+    fi
+
+    # Run the build inside the container
+    # We map the source directory to /app
+    # We explicitly call the build script inside.
+    # Since we need to run specific commands (cmake config then build), we'll pass a script
+    log "Running build inside container..."
+    
+    local build_script="
+    set -e
+    mkdir -p $LCM_BUILD_DIR
+    cd $LCM_BUILD_DIR
+    cmake .. -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DGGML_CUDA=ON
+    cmake --build . -j \$(nproc)
+    "
+
+    # Note: We mount the host's LLAMA_DIR to /app/src inside container
+    # But wait, LCM_LLAMA_DIR is usually ~/.local/src/llama.cpp
+    # We need to ensure permissions match.
+    
+    if ! $runtime run --rm -it $gpu_flags \
+        -v "$LCM_LLAMA_DIR:/app/src" \
+        -v "$LCM_BIN_DIR:/app/bin" \
+        -u "$(id -u):$(id -g)" \
+        -w /app/src/build \
+        lcm-builder \
+        /bin/bash -c "cmake .. -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DGGML_CUDA=ON && cmake --build . -j \$(nproc) && cp bin/llama-cli /app/bin/ && cp bin/llama-server /app/bin/"; then
+        error "Containerized build failed."
+    fi
+    
+    log "Containerized build complete. Binaries copied to $LCM_BIN_DIR"
+}
+
+check_status() {
+    log "Checking llama-cpp-manager status..."
+    local all_ok=1
+    local deps=()
+    local missing_deps=()
+
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        deps=(git git-lfs cmake build-essential pkg-config python3 libopenblas-dev curl)
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        deps=(git git-lfs cmake python3 pkg-config curl)
+    fi
+
+    echo "--- 1. Dependencies ---"
+    for dep in "${deps[@]}"; do
+        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+            if dpkg -s "$dep" >/dev/null 2>&1 || which "$dep" >/dev/null 2>&1; then
+                local info=""
+                [ "$dep" == "python3" ] && info=" ($(python3 --version | awk '{print $2}'))"
+                [ "$dep" == "cmake" ] && info=" ($(cmake --version | head -n1 | awk '{print $3}'))"
+                echo "[OK]      $dep$info"
+            else
+                echo "[MISSING] $dep"
+                missing_deps+=("$dep")
+                all_ok=0
+            fi
+        else
+            if which "$dep" >/dev/null 2>&1; then
+                echo "[OK]      $dep"
+            else
+                echo "[MISSING] $dep"
+                missing_deps+=("$dep")
+                all_ok=0
+            fi
+        fi
+    done
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        local gv
+        gv=$(ldd --version | head -n1 | grep -oE '[0-9]+\.[0-9]+' | tail -n1)
+        if [[ $(echo -e "$gv\n2.41" | sort -V | head -n1) == "2.41" ]]; then
+            echo "[WARNING] glibc ($gv) - Unsupported by CUDA 12 (sinpi/cospi conflict)"
+            echo "          GPU acceleration will be DISABLED on host. Use --container for GPU."
+        else
+            echo "[OK]      glibc ($gv)"
+        fi
+    fi
+
+    echo ""
+    echo "--- 2. Container Readiness ---"
+    local runtime=""
+    if command -v docker >/dev/null 2>&1; then
+        runtime="docker"
+    elif command -v podman >/dev/null 2>&1; then
+        runtime="podman"
+    fi
+
+    if [ -n "$runtime" ]; then
+        if $runtime ps >/dev/null 2>&1; then
+            echo "[OK]      $runtime is installed and functional"
+        else
+            echo "[WARNING] $runtime is installed but requires sudo or permissions"
+        fi
+    else
+        echo "[INFO]    No container runtime (docker/podman) found."
+    fi
+
+    echo ""
+    echo "--- 3. Repository ---"
+    if [ -d "$LCM_LLAMA_DIR/.git" ]; then
+        echo "[OK]      Source cloned at $LCM_LLAMA_DIR"
+    else
+        echo "[MISSING] Source repository not found at $LCM_LLAMA_DIR"
+        all_ok=0
+    fi
+
+    echo ""
+    echo "--- 4. Binaries ---"
+    local bins=(llama-cli llama-server)
+    for bin in "${bins[@]}"; do
+        if [ -x "$LCM_BIN_DIR/$bin" ]; then
+            echo "[OK]      $bin found in $LCM_BIN_DIR"
+        else
+            echo "[MISSING] $bin not found or not executable in $LCM_BIN_DIR"
+            all_ok=0
+        fi
+    done
+
+    echo ""
+    echo "--- 5. Hardware Acceleration ---"
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "[OK]      NVIDIA GPU detected (via nvidia-smi)"
+            if command -v nvcc >/dev/null 2>&1; then
+                echo "[OK]      CUDA Toolkit (nvcc) found"
+                
+                # Check GCC version compatibility for CUDA
+                local gcc_ver
+                if command -v gcc >/dev/null 2>&1; then
+                    gcc_ver=$(gcc -dumpversion | cut -d. -f1)
+                    if [ "$gcc_ver" -ge 15 ]; then
+                        echo "[WARNING] Default GCC version ($gcc_ver) is likely too new for CUDA (max supported: 14)"
+                    else
+                        echo "[OK]      Default GCC version ($gcc_ver) is compatible with CUDA"
+                    fi
+                fi
+
+                # List other installed GCC versions
+                local compat_versions=()
+                for ver in 14 13 12 11; do
+                    if command -v "gcc-$ver" >/dev/null 2>&1; then
+                        compat_versions+=("$ver")
+                    fi
+                done
+                if [ ${#compat_versions[@]} -gt 0 ]; then
+                    echo "[INFO]    Found other compatible GCC versions: ${compat_versions[*]}"
+                    if [ "$gcc_ver" -ge 15 ]; then
+                        echo "          (lcm will automatically use gcc-${compat_versions[0]} during build)"
+                    fi
+                else
+                    if [ "$gcc_ver" -ge 15 ]; then
+                        echo "[MISSING] No compatible GCC versions (11-14) found on system."
+                        all_ok=0
+                    fi
+                fi
+            else
+                echo "[MISSING] CUDA Toolkit (nvcc) not found in PATH"
+                echo "          Required for NVIDIA GPU acceleration."
+                all_ok=0
+            fi
+        elif command -v rocm-smi >/dev/null 2>&1; then
+            echo "[OK]      AMD GPU detected (via rocm-smi)"
+            echo "[WARNING] ROCm/HIP support is experimental in llama-cpp-manager."
+        else
+            echo "[INFO]    No dedicated GPU detected. Falling back to CPU."
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        if [[ "$(uname -m)" == "arm64" ]]; then
+            echo "[OK]      Apple Silicon detected (Metal supported)"
+        else
+            echo "[OK]      Intel Mac detected (Metal supported)"
+        fi
+    fi
+
+    echo ""
+    echo "--- 6. Proposed Build Environment ---"
+    local selected_cc="gcc"
+    local selected_cxx="g++"
+    local source_type="default"
+
+    if [ -n "${LCM_CC:-}" ]; then
+        selected_cc="$LCM_CC"
+        selected_cxx="${LCM_CXX:-g++}"
+        source_type="env (manual override)"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]] && command -v nvcc >/dev/null 2>&1; then
+        local gver
+        gver=$(gcc -dumpversion | cut -d. -f1)
+        if [ "$gver" -ge 15 ]; then
+            for v in 14 13 12 11; do
+                if command -v "gcc-$v" >/dev/null 2>&1; then
+                    selected_cc="gcc-$v"
+                    selected_cxx="g++-$v"
+                    source_type="auto-detected (compatibility)"
+                    break
+                fi
+            done
+        fi
+    fi
+    echo "  C Compiler:   $selected_cc ($source_type)"
+    echo "  C++ Compiler: $selected_cxx ($source_type)"
+
+    echo ""
+    echo "--- 7. Environment ---"
+    if [[ ":$PATH:" == *":$LCM_BIN_DIR:"* ]]; then
+        echo "[OK]      $LCM_BIN_DIR is in your PATH"
+    else
+        echo "[WARNING] $LCM_BIN_DIR is NOT in your PATH"
+        # Not marking all_ok=0 for PATH as it's a UX warning
+    fi
+
+    echo ""
+    echo "--- 8. Build Suggestions ---"
+    if command -v ccache >/dev/null 2>&1; then
+        echo "[OK]      ccache is installed (will be used for faster builds)"
+    else
+        echo "[INFO]    ccache not found. Installing it can significantly speed up rebuilds."
+        if [ -f /etc/debian_version ]; then
+            echo "          Suggestion: sudo apt install -y ccache"
+        elif [[ "$OSTYPE" == "darwin"* ]]; then
+            echo "          Suggestion: brew install ccache"
+        fi
+    fi
+
+    echo ""
+    echo "--- 9. Remediation & Environment Setup ---"
+    if [ "$all_ok" -eq 1 ] && [[ ":$PATH:" == *":$LCM_BIN_DIR:"* ]]; then
+        log "System is READY to run llama.cpp."
+        return
+    fi
+
+    echo "################################################################################"
+    echo "#                         FIXING YOUR ENVIRONMENT                              #"
+    echo "################################################################################"
+    echo "Follow these steps in order to prepare your environment for building:"
+    echo ""
+
+    local step=1
+
+    # 1. Dependencies
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo "  STEP $step: Install System Dependencies"
+        echo "    Missing: ${missing_deps[*]}"
+        if [[ "$OSTYPE" == "linux-gnu"* ]] && [ -f /etc/debian_version ]; then
+            echo "    Run: sudo apt update && sudo apt install -y ${missing_deps[*]}"
+        elif [[ "$OSTYPE" == "darwin"* ]]; then
+            echo "    Run: brew install ${missing_deps[*]}"
+        else
+            echo "    Fix: Install these using your system package manager."
+        fi
+        echo ""
+        step=$((step + 1))
+    fi
+
+    # 2. GCC Compatibility
+    if [[ "$OSTYPE" == "linux-gnu"* ]] && command -v nvcc >/dev/null 2>&1; then
+        local current_gcc
+        current_gcc=$(gcc -dumpversion | cut -d. -f1)
+        if [ "$current_gcc" -ge 15 ]; then
+            local best_alt=""
+            for v in 14 13 12 11; do
+                if command -v "gcc-$v" >/dev/null 2>&1; then
+                    best_alt="gcc-$v"
+                    break
+                fi
+            done
+            
+            if [ -z "$best_alt" ]; then
+                echo "  STEP $step: Install Supported GCC Version (Required for CUDA)"
+                echo "    Your default GCC ($current_gcc) is too new for CUDA."
+                if [ -f /etc/debian_version ]; then
+                    echo "    Run: sudo apt update && sudo apt install -y gcc-14 g++-14"
+                else
+                    echo "    Fix: Install GCC 11, 12, 13, or 14."
+                fi
+                echo ""
+                step=$((step + 1))
+            elif [ "$best_alt" != "gcc-14" ]; then
+                echo "  STEP $step: Install GCC 14 (Optional but Recommended)"
+                echo "    Default GCC ($current_gcc) is unsupported. You have $best_alt,"
+                echo "    but GCC 14 provides the best compatibility for CUDA 12."
+                if [ -f /etc/debian_version ]; then
+                    echo "    Run: sudo apt update && sudo apt install -y gcc-14 g++-14"
+                fi
+                echo ""
+                step=$((step + 1))
+            fi
+        fi
+    fi
+
+    # 3. glibc & CUDA Container Recommendation
+    if [[ "$OSTYPE" == "linux-gnu"* ]] && command -v nvcc >/dev/null 2>&1; then
+        local gv
+        gv=$(ldd --version | head -n1 | grep -oE '[0-9]+\.[0-9]+' | tail -n1)
+        if [[ $(echo -e "$gv\n2.41" | sort -V | head -n1) == "2.41" ]]; then
+            echo "  STEP $step: Containerized Build Required for GPU"
+            echo "    Your glibc version ($gv) is unsupported by CUDA."
+            echo "    Host builds will be CPU-ONLY."
+            if [ -n "$runtime" ]; then
+                echo "    To build with GPU support, use the stable container environment:"
+                echo "    Run: ./lcm --build --container"
+            else
+                echo "    To build with GPU support, install Docker/Podman."
+                echo "    Otherwise, ./lcm --build will default to CPU-only."
+            fi
+            echo ""
+            step=$((step + 1))
+        fi
+    fi
+
+    # 4. Source Repository
+    if [ ! -d "$LCM_LLAMA_DIR/.git" ]; then
+        echo "  STEP $step: Clone Source Repository"
+        if [ -d "$LCM_LLAMA_DIR" ]; then
+            echo "    Directory exists but is incomplete. Please clean it first."
+            echo "    Run: rm -rf $LCM_LLAMA_DIR"
+        fi
+        echo "    Run: ./lcm --clone"
+        echo ""
+        step=$((step + 1))
+    fi
+
+    # 4. Build
+    if [ ! -x "$LCM_BIN_DIR/llama-cli" ]; then
+        echo "  STEP $step: Build Binaries"
+        echo "    Run: ./lcm --build"
+        echo ""
+        step=$((step + 1))
+    fi
+
+    # 5. PATH
+    if [[ ":$PATH:" != *":$LCM_BIN_DIR:"* ]]; then
+        echo "  STEP $step: Update your PATH"
+        echo "    Add this to your shell profile (~/.bashrc or ~/.zshrc):"
+        echo "      export PATH=\"\$PATH:$LCM_BIN_DIR\""
+        echo "    Then run: source ~/.bashrc (or ~/.zshrc)"
+        echo ""
+    fi
+}
+
+# --- Main Execution ---
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    --install-llama-cpp)
+        check_dependencies
+        clone_repo
+        build_llama_cpp
+        install_binaries
+        log "Installation complete."
+        ;;
+    --update-llama-cpp)
+        update_repo
+        build_llama_cpp
+        install_binaries
+        log "Update complete."
+        ;;
+    --build)
+        use_container=0
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --container) use_container=1; shift ;;
+                --cpu) export LCM_FORCE_CPU=1; shift ;;
+                *) break ;;
+            esac
+        done
+
+        if [ "$use_container" -eq 1 ]; then
+            build_in_container
+        else
+            build_llama_cpp
+            install_binaries
+        fi
+        log "Build complete."
+        ;;
+    --run)
+        shift
+        run_sanity_check "$@"
+        ;;
+    --status)
+        check_status
+        ;;
+    --clean)
+        log "Cleaning build artifacts in $LCM_BUILD_DIR..."
+        rm -rf "$LCM_BUILD_DIR"
+        log "Done."
+        ;;
+    --clone)
+        clone_repo
+        log "Repository ready."
+        ;;
+    --help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac

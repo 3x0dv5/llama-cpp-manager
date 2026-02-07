@@ -1,0 +1,32 @@
+{
+  "hardware": {
+    "cpu_cores_physical": 12,
+    "cpu_cores_logical": 24,
+    "ram_total_mb": 128729,
+    "gpu_type": "CUDA",
+    "gpu_vram_mb": 24564
+  },
+  "software": {
+    "binary_path": "/home/u/.local/bin/llama-cli",
+    "binary_type": "CPU"
+  },
+  "model": {
+    "path": "/home/u/.cache/llama.cpp/unsloth_Qwen3-Coder-Next-GGUF_Qwen3-Coder-Next-Q4_K_M.gguf",
+    "size_mb": 46259
+  },
+  "recommended_params": {
+    "--threads": 11,
+    "--n-gpu-layers": 0,
+    "--ctx-size": 4096,
+    "--batch-size": 256,
+    "--mlock": true
+  },
+  "rationale": [
+    "Threads: 11 (Physical cores 12 - 1 reserved)",
+    "GPU Support: Hardware has CUDA, but llama-cli was compiled for CPU only. Forcing CPU mode.",
+    "GPU Offload: None (CPU only)",
+    "Context: 4096 (Safe default)",
+    "Batch Size: 256 (CPU optimized)",
+    "Memory Lock: Enabled (Sys RAM 128729MB >> Model 46259MB)"
+  ]
+}
