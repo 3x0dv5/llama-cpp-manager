@@ -4,48 +4,48 @@ This file provides context and instructions for AI agents working on the `llama-
 
 ## Project Overview
 
-**llama-cpp-manager** is a repeatable, idempotent, user-local manager for the upstream [llama.cpp](https://github.com/ggerganov/llama.cpp) project on Linux and MacOS. It automates the installation of dependencies, handles source updates, auto-detects GPU capabilities (CUDA/Metal), and manages builds via CMake.
+**llama-cpp-manager** (lcm) is a repeatable, idempotent, user-local manager for the upstream [llama.cpp](https://github.com/ggerganov/llama.cpp) project on Linux and MacOS. It automates dependency management, source updates, hardware detection, and optimized builds.
 
 ### Core Goals
 - **Repeatability:** Idempotent installation that converges to a stable state.
-- **GPU Auto-Detection:** Automatically enables CUDA if `nvcc` is present, falling back to CPU if not.
+- **Hardware-Aware:** Auto-detects CUDA/Metal/CPU capabilities and provides optimized runtime parameters.
+- **Stability:** Specifically designed to handle modern system incompatibilities (e.g., GCC 15 / glibc 2.41 conflicts) via automated workarounds or containerized builds.
 - **User-Local:** Installs artifacts to `~/.local` to avoid cluttering system directories.
-- **Strict Management:** Does not fork upstream or bundle models; focuses solely on the lifecycle of the `llama.cpp` binaries.
 
 ## Project Status
 
-As of February 2026, the project is in the **specification/bootstrap phase**. The core system specification is defined in `docs/system-spec.md`. Implementation of the primary Bash entrypoint is pending.
+As of February 2026, the core manager is **fully implemented** and functional. The system supports automated installation, hardware optimization, Hugging Face model management, and Docker-based stable build environments.
 
 ## Technology Stack
 
-- **Primary Language:** Bash 4.4+ (for the manager script).
+- **Primary Language:** Bash 4.4+ (Entrypoint script).
+- **Secondary Language:** Python 3 (Optimization logic).
 - **Build System:** CMake (for building llama.cpp).
-- **Target OS:** Ubuntu 22.04+ (Primary), Debian-based (Best-effort).
-- **Target Architectures:** x86_64 (Primary), ARM64 (CPU-only).
-- **Dependencies:** `git`, `cmake`, `build-essential`, `pkg-config`, `python3`, `libopenblas-dev`.
-- **Optional:** `ccache` (build speed), NVIDIA CUDA Toolkit.
+- **Containerization:** Docker/Podman (for stable build environments).
+- **Target OS:** Ubuntu 22.04+ (Primary), Debian-based, MacOS 13.0+.
+- **Dependencies:** `git`, `git-lfs`, `cmake`, `build-essential`, `pkg-config`, `python3`, `curl`, `libopenblas-dev`.
 
-## Building and Running
+## Key Commands
 
-The tool is intended to be used as a CLI script (e.g., `lcm`).
-
-### Key Commands (Planned)
-- `--install-llama-cpp`: Install dependencies, clone, and build.
+- `--install-llama-cpp`: Full automated setup (dependencies, clone, build).
 - `--update-llama-cpp`: Pull latest upstream changes and rebuild.
-- `--build`: Re-run CMake build without updating source.
-- `--run --model <path>`: Execute a minimal inference sanity check.
+- `--build [--container | --cpu]`: Re-run CMake build with optional containerization or CPU-only enforcement.
+- `--run --model <path|url|-hf repo:file> [--optimize [file]] [--config file] [--mode cli|server]`: Execute inference or optimize parameters.
+- `--status`: Comprehensive system audit and remediation guide.
+- `--clean`: Remove build artifacts.
+- `--clone`: Manually clone the source repository.
 
 ## Development Conventions
 
-- **Shell Standards:** Scripts should be `shellcheck`-clean and follow Bash 4.4+ conventions.
-- **Idempotency:** All commands must be safely re-runnable.
-- **Sudo Usage:** `sudo` is restricted *only* to `apt` dependency installation.
-- **Logging:** Use timestamped logs and clear fallback messages (e.g., when falling back from CUDA to CPU).
-- **Licensing:** The project is licensed under the **MIT License**. Ensure all new files are consistent with this.
+- **Logging:** All log output is directed to `stderr` to ensure `stdout` remains clean for programmatic data (like JSON).
+- **Namespace:** All environment variables use the `LCM_` prefix (e.g., `LCM_LLAMA_DIR`).
+- **Workarounds:** Always check `detect_backend_flags` for logic regarding GCC/glibc version handling.
+- **Licensing:** MIT License - Rui Lima (ruilima.ai).
 
 ## Key Files
 
-- `README.md`: Basic project description.
-- `LICENSE`: MIT License terms.
-- `docs/system-spec.md`: Comprehensive system architecture and CLI specification.
+- `lcm`: The primary Bash entrypoint.
+- `Dockerfile.lcm`: Stable build environment (Ubuntu 22.04 + CUDA 12).
+- `docs/MANUAL.md`: Comprehensive user and technical guide.
+- `docs/system-spec.md`: Original architecture specification.
 - `GEMINI.md`: AI context and project guidelines (this file).
