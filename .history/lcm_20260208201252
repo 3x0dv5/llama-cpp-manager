@@ -88,11 +88,6 @@ Examples:
   # Optimize parameters for a local model
   ./lcm --run --model ~/models/llama-3-8b.gguf --optimize
 
-  # Multi-Server Setup (Chat, Embedding, Reranker on different ports)
-  ./lcm --run --config production.json --chat --port 8080 --threads 6 --mode server
-  ./lcm --run --config production.json --embedding --port 8081 --threads 2 --mode server
-  ./lcm --run --config production.json --re-ranker --port 8082 --threads 2 --mode server
-
   # Download and run a Hugging Face model (standard llama-cpp syntax)
   ./lcm --run --model -hf unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M --download-dir /media/u/Models/lcm_models/
 

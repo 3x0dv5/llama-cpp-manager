@@ -65,13 +65,6 @@ Arguments for --run:
   --mode <cli|server>    Execution mode: cli (default) or server
   --download-dir <path>  Enable auto-download and set target directory
 
-Multi-Server Filtering (use with --config):
-  --embedding            Run only embedding models
-  --re-ranker            Run only reranker models
-  --chat                 Run only chat models (default: all)
-  --port <port>          Override server port
-  --threads <n>          Override thread count
-
 Environment Variables:
   LCM_LLAMA_DIR    Source checkout directory (default: $HOME/.local/src/llama.cpp)
   LCM_BIN_DIR      Binary symlink directory (default: $HOME/.local/bin)
@@ -87,11 +80,6 @@ Examples:
 
   # Optimize parameters for a local model
   ./lcm --run --model ~/models/llama-3-8b.gguf --optimize
-
-  # Multi-Server Setup (Chat, Embedding, Reranker on different ports)
-  ./lcm --run --config production.json --chat --port 8080 --threads 6 --mode server
-  ./lcm --run --config production.json --embedding --port 8081 --threads 2 --mode server
-  ./lcm --run --config production.json --re-ranker --port 8082 --threads 2 --mode server
 
   # Download and run a Hugging Face model (standard llama-cpp syntax)
   ./lcm --run --model -hf unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M --download-dir /media/u/Models/lcm_models/
@@ -769,11 +757,6 @@ run_sanity_check() {
         fi
         log "Loading configuration from $config_file..."
         
-        # Export for Python script
-        export LCM_FILTER_MODE="$filter_mode"
-        export LCM_OVERRIDE_PORT="$override_port"
-        export LCM_OVERRIDE_THREADS="$override_threads"
-
         # Use Python to parse the JSON and extract params + models
         local json_output
         json_output=$(python3 -c "
@@ -819,15 +802,6 @@ try:
         if not params:
              params = data.get('recommended_params', {})
              
-        # Apply Overrides
-        override_port = os.environ.get('LCM_OVERRIDE_PORT', '')
-        override_threads = os.environ.get('LCM_OVERRIDE_THREADS', '')
-        
-        if override_port:
-            params['--port'] = override_port
-        if override_threads:
-            params['--threads'] = override_threads
-
         for k, v in params.items():
             if isinstance(v, bool):
                 if v: print(k)
@@ -836,27 +810,10 @@ try:
         
         # Handle Models
         models = data.get('models', [])
-        filter_mode = os.environ.get('LCM_FILTER_MODE', '')
-        
         hf_models_list = []
         local_models_args = []
 
-        found_any = False
-
         for m in models:
-            # Filter Logic
-            is_embed = m.get('is_embedding', False)
-            is_rerank = m.get('is_reranker', False)
-            
-            if filter_mode == 'embedding':
-                if not is_embed: continue
-            elif filter_mode == 'reranker':
-                if not is_rerank: continue
-            elif filter_mode == 'chat':
-                if is_embed or is_rerank: continue
-            
-            found_any = True
-            
             path = m.get('path')
             alias = m.get('alias')
             if path:
@@ -877,9 +834,6 @@ try:
                     local_models_args.append(f'-m {path}')
                     if alias:
                         local_models_args.append(f'-a {alias}')
-
-        if not found_any and filter_mode:
-            print(f'[WARNING] No models found for filter mode: {filter_mode}', file=sys.stderr)
 
         if hf_models_list:
             # Escape double quotes for Bash here too!

@@ -1,5 +1,5 @@
 {
-  "hardware": {
+  "system": {
     "cpu_cores_physical": 12,
     "cpu_cores_logical": 24,
     "ram_total_mb": 128729,
@@ -10,12 +10,18 @@
     "binary_path": "/home/u/.local/bin/llama-cli",
     "binary_type": "CPU"
   },
-  "model": {
-    "path": "/home/u/.cache/llama.cpp/unsloth_Qwen3-Coder-Next-GGUF_Qwen3-Coder-Next-Q4_K_M.gguf",
-    "size_mb": 46259
-  },
-  "recommended_params": {
-    "--threads": 4,
+  "models": [
+    {
+      "source": "local",
+      "path": "/home/u/.cache/llama.cpp/unsloth_Qwen3-Coder-Next-GGUF_Qwen3-Coder-Next-Q4_K_M.gguf",
+      "size_mb": 46259,
+      "alias": "unsloth_Qwen3-Coder-Next-GGUF_Qwen3-Coder-Next-Q4_K_M.gguf",
+      "is_embedding": false,
+      "is_reranker": false
+    }
+  ],
+  "server_params": {
+    "--threads": 11,
     "--n-gpu-layers": 0,
     "--ctx-size": 4096,
     "--batch-size": 256,
@@ -27,6 +33,6 @@
     "GPU Offload: None (CPU only)",
     "Context: 4096 (Safe default)",
     "Batch Size: 256 (CPU optimized)",
-    "Memory Lock: Enabled (Sys RAM 128729MB >> Model 46259MB)"
+    "Memory Lock: Enabled (Sys RAM 128729MB >> Models 46259MB)"
   ]
 }

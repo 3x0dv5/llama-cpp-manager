@@ -65,13 +65,6 @@ Arguments for --run:
   --mode <cli|server>    Execution mode: cli (default) or server
   --download-dir <path>  Enable auto-download and set target directory
 
-Multi-Server Filtering (use with --config):
-  --embedding            Run only embedding models
-  --re-ranker            Run only reranker models
-  --chat                 Run only chat models (default: all)
-  --port <port>          Override server port
-  --threads <n>          Override thread count
-
 Environment Variables:
   LCM_LLAMA_DIR    Source checkout directory (default: $HOME/.local/src/llama.cpp)
   LCM_BIN_DIR      Binary symlink directory (default: $HOME/.local/bin)
@@ -87,11 +80,6 @@ Examples:
 
   # Optimize parameters for a local model
   ./lcm --run --model ~/models/llama-3-8b.gguf --optimize
-
-  # Multi-Server Setup (Chat, Embedding, Reranker on different ports)
-  ./lcm --run --config production.json --chat --port 8080 --threads 6 --mode server
-  ./lcm --run --config production.json --embedding --port 8081 --threads 2 --mode server
-  ./lcm --run --config production.json --re-ranker --port 8082 --threads 2 --mode server
 
   # Download and run a Hugging Face model (standard llama-cpp syntax)
   ./lcm --run --model -hf unsloth/Qwen3-Coder-Next-GGUF:Q4_K_M --download-dir /media/u/Models/lcm_models/
@@ -582,23 +570,18 @@ resolve_model_path() {
     
     # Handle Hugging Face identifier (-hf repo:file)
     if [[ "$input_path" == "-hf "* ]]; then
+        # If no download dir, we skip OUR download logic and let llama-cli handle it
+        if [ -z "$download_dir" ]; then
+            echo "$input_path"
+            return
+        fi
+        
         local hf_id="${input_path#-hf }"
         local repo="${hf_id%:*}"
         local file="${hf_id#*:}"
-
+        
         if [[ "$repo" == "$file" ]]; then
             error "Invalid Hugging Face identifier: $hf_id (expected repo:file)"
-        fi
-
-        # If no download dir, we try to resolve from cache first, otherwise let llama-cli handle it
-        if [ -z "$download_dir" ]; then
-            local cached_path
-            if cached_path=$(find_cached_model_file "$repo" "$file"); then
-                echo "$cached_path"
-                return
-            fi
-            echo "$input_path"
-            return
         fi
 
         # Normalise download dir
@@ -676,10 +659,6 @@ run_sanity_check() {
     local mode="cli"
     local config_file=""
 
-    local filter_mode=""
-    local override_port=""
-    local override_threads=""
-
     while [[ $# -gt 0 ]]; do
         case $1 in
             --model)
@@ -705,11 +684,6 @@ run_sanity_check() {
             --download-dir) download_dir="$2"; shift 2 ;;
             --mode) mode="$2"; shift 2 ;;
             --config) config_file="$2"; shift 2 ;;
-            --embedding) filter_mode="embedding"; shift ;;
-            --re-ranker|--reranker) filter_mode="reranker"; shift ;;
-            --chat) filter_mode="chat"; shift ;;
-            --port) override_port="$2"; shift 2 ;;
-            --threads) override_threads="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -769,121 +743,45 @@ run_sanity_check() {
         fi
         log "Loading configuration from $config_file..."
         
-        # Export for Python script
-        export LCM_FILTER_MODE="$filter_mode"
-        export LCM_OVERRIDE_PORT="$override_port"
-        export LCM_OVERRIDE_THREADS="$override_threads"
-
         # Use Python to parse the JSON and extract params + models
         local json_output
         json_output=$(python3 -c "
 import json
 import sys
-import os
-import glob
-
-def resolve_hf_path(repo, file):
-    # 1. Check llama.cpp native cache
-    llama_cache = os.path.expanduser('~/.cache/llama.cpp')
-    if os.path.isdir(llama_cache):
-        flat_repo = repo.replace('/', '_')
-        pattern = os.path.join(llama_cache, f'*{flat_repo}*{file}*.gguf')
-        matches = glob.glob(pattern)
-        if matches:
-             return matches[0]
-
-    # 2. Check HF Hub cache
-    hf_cache = os.path.expanduser('~/.cache/huggingface/hub')
-    repo_folder = 'models--' + repo.replace('/', '--')
-    snapshots_dir = os.path.join(hf_cache, repo_folder, 'snapshots')
-    if os.path.isdir(snapshots_dir):
-         # Get latest snapshot by mtime
-         snapshots = sorted(os.listdir(snapshots_dir), key=lambda x: os.path.getmtime(os.path.join(snapshots_dir, x)), reverse=True)
-         if snapshots:
-             latest_snap = snapshots[0]
-             search_file = file
-             if not search_file.endswith('.gguf'):
-                 search_file += '.gguf'
-             
-             full_path = os.path.join(snapshots_dir, latest_snap, search_file)
-             if os.path.isfile(full_path):
-                 return full_path
-    return None
-
 try:
     with open('$config_file', 'r') as f:
         data = json.load(f)
         
-        # Handle Params
+        # Handle Params (New 'server_params' vs Old 'recommended_params')
         params = data.get('server_params', {})
         if not params:
              params = data.get('recommended_params', {})
              
-        # Apply Overrides
-        override_port = os.environ.get('LCM_OVERRIDE_PORT', '')
-        override_threads = os.environ.get('LCM_OVERRIDE_THREADS', '')
-        
-        if override_port:
-            params['--port'] = override_port
-        if override_threads:
-            params['--threads'] = override_threads
-
         for k, v in params.items():
             if isinstance(v, bool):
                 if v: print(k)
             else:
                 print(f'{k} {v}')
         
-        # Handle Models
+        # Handle Models (New 'models' list)
         models = data.get('models', [])
-        filter_mode = os.environ.get('LCM_FILTER_MODE', '')
-        
         hf_models_list = []
         local_models_args = []
 
-        found_any = False
-
         for m in models:
-            # Filter Logic
-            is_embed = m.get('is_embedding', False)
-            is_rerank = m.get('is_reranker', False)
-            
-            if filter_mode == 'embedding':
-                if not is_embed: continue
-            elif filter_mode == 'reranker':
-                if not is_rerank: continue
-            elif filter_mode == 'chat':
-                if is_embed or is_rerank: continue
-            
-            found_any = True
-            
             path = m.get('path')
-            alias = m.get('alias')
+            alias = m.get('alias') # Alias might still be useful for individual models
             if path:
                 if path.startswith('-hf '):
-                    hf_id = path[4:]
-                    resolved = None
-                    if ':' in hf_id:
-                        repo, file = hf_id.split(':', 1)
-                        resolved = resolve_hf_path(repo, file)
-                    
-                    if resolved:
-                        local_models_args.append(f'-m {resolved}')
-                        if alias:
-                            local_models_args.append(f'-a {alias}')
-                    else:
-                        hf_models_list.append(hf_id)
+                    hf_models_list.append(path[4:]) # Collect the actual repo:file string
                 else:
                     local_models_args.append(f'-m {path}')
                     if alias:
                         local_models_args.append(f'-a {alias}')
 
-        if not found_any and filter_mode:
-            print(f'[WARNING] No models found for filter mode: {filter_mode}', file=sys.stderr)
-
         if hf_models_list:
-            # Escape double quotes for Bash here too!
-            print(f'-hf {\",\".join(hf_models_list)}')
+            # If there are HF models, output them as a single comma-separated -hf argument
+            print(f'-hf {",".join(hf_models_list)}')
 
         for arg in local_models_args:
             print(arg)
@@ -1203,20 +1101,7 @@ check_status() {
     fi
 
     echo ""
-    echo "--- 9. Model Cache ---"
-    local cache_dir="${LLAMA_CACHE:-$HOME/.cache/llama.cpp}"
-    echo "  Default Cache: $cache_dir"
-    if [ -d "$cache_dir" ]; then
-        local cache_size
-        cache_size=$(du -sh "$cache_dir" 2>/dev/null | awk '{print $1}')
-        echo "[OK]      Cache exists (Size: $cache_size)"
-    else
-        echo "[INFO]    Cache directory does not exist yet (it will be created on first use)"
-    fi
-    echo "  Manual Cache:  Set via --download-dir during --run"
-
-    echo ""
-    echo "--- 10. Remediation & Environment Setup ---"
+    echo "--- 9. Remediation & Environment Setup ---"
     if [ "$all_ok" -eq 1 ] && [[ ":$PATH:" != *":$LCM_BIN_DIR:"* ]]; then
         log "System is READY to run llama.cpp."
         return
